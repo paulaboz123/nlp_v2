@@ -1,19 +1,25 @@
-NLP PIPELINE — FINAL (Python 3.11)
+ONE-NOTEBOOK NLP PIPELINE (Python 3.11)
 
-THIS ZIP IS ORDERED AND RUNNABLE.
+Files:
+- full_pipeline_end_to_end.ipynb  (run top-to-bottom)
+- requirements.txt
 
-RUN ORDER:
-00_filter_and_resplit.ipynb
-01_relevance_models.ipynb
-02_group_classifier.ipynb
-03_label_cross_encoder.ipynb
-04_label_hierarchical_transformer.ipynb
-05_compare_label_models.ipynb
-06_improve_topN_hardneg.ipynb
-
-Each notebook SAVES its outputs to disk and the next notebook LOADS them.
-
-Expected input files:
+Expected inputs (edit paths in the notebook CONFIG cell):
 - train.csv
 - test.csv
-- labels.csv
+- labels.csv  (must include columns: demand_id, exclude; exclude==1 means drop)
+
+Expected columns in train/test:
+- text
+- demand_id
+- group_id
+- relevant OR relevance (0/1)
+Optionally: other columns are preserved.
+
+Outputs (created in ./artifacts):
+- train_clean.csv, test_clean.csv
+- relevance_model.joblib
+- group_model.joblib
+- cross_encoder/ (HF model + tokenizer)
+- hierarchical_transformer.pt + metadata.json
+- comparison_metrics.csv
