@@ -1,0 +1,131 @@
+# Task-Endpoint-Deployment.yml (AzureCLI@1)
+parameters:
+  environment: ''
+  serviceConnection: ''
+  resourceGroup: ''
+  amlWorkspace: ''
+  keyVaultName: ''
+  displayName: 'Deploy Model'
+  pythonVersion: '3.11'
+  sdkVersion: '1.31.0'
+  scriptExtraDependencies: ''   # opcjonalnie: np. "mlflow==2.17.2 azureml-mlflow==1.61.0.post1"
+  scriptPath: ''                # np. "pipelines/deploy/deploy_endpoint.py"
+  scriptArguments: ''           # np. "--endpoint-name xxx --deployment-name yyy ..."
+  failIfKeyVaultNotAccessible: true
+
+steps:
+  - task: UsePythonVersion@0
+    displayName: 'Use Python ${{ parameters.pythonVersion }}'
+    inputs:
+      versionSpec: '${{ parameters.pythonVersion }}'
+
+  # 1) Generate AML config: .azureml/config.json
+  - task: AzureCLI@1
+    displayName: 'Generate AML Workspace Config File'
+    inputs:
+      azureSubscription: '${{ parameters.serviceConnection }}'
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euxo pipefail
+        mkdir -p .azureml
+        subscription_id=$(az account show --query id -o tsv)
+        cat > .azureml/config.json << EOF
+        {
+          "subscription_id": "${subscription_id}",
+          "resource_group": "${{ parameters.resourceGroup }}",
+          "workspace_name": "${{ parameters.amlWorkspace }}"
+        }
+        EOF
+        echo "Wrote .azureml/config.json:"
+        cat .azureml/config.json
+
+  # 2) Deploy step (debug + KV test + SPN env mapping)
+  - task: AzureCLI@1
+    displayName: '${{ parameters.displayName }}'
+    inputs:
+      azureSubscription: '${{ parameters.serviceConnection }}'
+      scriptLocation: inlineScript
+      addSpnToEnvironment: true  # env vars: servicePrincipalId, servicePrincipalKey, tenantId
+      inlineScript: |
+        set -euxo pipefail
+
+        echo "=============================="
+        echo "STAGE: whoami / context"
+        echo "=============================="
+        az account show -o jsonc || true
+        echo "Agent: $(uname -a)"
+        echo "Python:"
+        python --version
+        echo "Pip:"
+        python -m pip --version
+
+        echo "=============================="
+        echo "STAGE: install dependencies"
+        echo "=============================="
+        python -m pip install --upgrade pip
+
+        deps="azure-ai-ml==${{ parameters.sdkVersion }} azure-identity"
+        if [ -n "${{ parameters.scriptExtraDependencies }}" ]; then
+          deps="$deps ${{ parameters.scriptExtraDependencies }}"
+        fi
+        echo "Installing deps: $deps"
+        python -m pip install $deps
+
+        echo "=============================="
+        echo "STAGE: azure ml extension (optional debug)"
+        echo "=============================="
+        az extension add -n ml -y || true
+        az extension show -n ml -o jsonc || true
+        az ml version || true
+
+        echo "=============================="
+        echo "STAGE: map SPN env vars for Python SDK"
+        echo "=============================="
+        export AZURE_CLIENT_ID="$servicePrincipalId"
+        export AZURE_TENANT_ID="$tenantId"
+        export AZURE_CLIENT_SECRET="$servicePrincipalKey"
+
+        export AZURE_LOG_LEVEL=info
+        export AZURE_CORE_LOGGING_ENABLE=1
+
+        echo "AZURE_CLIENT_ID length: ${#AZURE_CLIENT_ID}"
+        echo "AZURE_TENANT_ID: $AZURE_TENANT_ID"
+        echo "AZURE_CLIENT_SECRET length: ${#AZURE_CLIENT_SECRET}"
+
+        echo "=============================="
+        echo "STAGE: show workspace (RBAC check)"
+        echo "=============================="
+        az ml workspace show -g "${{ parameters.resourceGroup }}" -w "${{ parameters.amlWorkspace }}" -o jsonc --debug || true
+
+        echo "=============================="
+        echo "STAGE: Key Vault access test"
+        echo "=============================="
+        if [ -n "${{ parameters.keyVaultName }}" ]; then
+          az keyvault show -n "${{ parameters.keyVaultName }}" -o jsonc --debug || true
+
+          set +e
+          az keyvault secret list --vault-name "${{ parameters.keyVaultName }}" --maxresults 1 -o table
+          kv_rc=$?
+          set -e
+
+          if [ $kv_rc -ne 0 ]; then
+            echo "ERROR: Pipeline identity cannot list secrets in Key Vault: ${{ parameters.keyVaultName }}"
+            if [ "${{ parameters.failIfKeyVaultNotAccessible }}" = "true" ]; then
+              exit 13
+            else
+              echo "WARN: continuing despite KV access failure (failIfKeyVaultNotAccessible=false)"
+            fi
+          else
+            echo "Key Vault access OK."
+          fi
+        else
+          echo "No keyVaultName provided; skipping KV test."
+        fi
+
+        echo "=============================="
+        echo "STAGE: run deploy script"
+        echo "=============================="
+        echo "Script path: ${{ parameters.scriptPath }}"
+        echo "Script args: ${{ parameters.scriptArguments }}"
+
+        python "${{ parameters.scriptPath }}" ${{ parameters.scriptArguments }}
