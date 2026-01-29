@@ -1,63 +1,44 @@
-set -euxo pipefail
+- task: AzureCLI@2
+  name: deploy_managed_endpoint
+  displayName: Deploy Managed Endpoint
+  inputs:
+    azureSubscription: ${{parameters.serviceConnection}}
+    scriptType: bash
+    scriptLocation: inlineScript
+    failOnStandardError: true
+    inlineScript: |
+      set -euo pipefail
 
-az configure --defaults workspace=${{parameters.amlWorkspace}} group=${{parameters.resourceGroup}}
+      az configure --defaults workspace=${{parameters.amlWorkspace}} group=${{parameters.resourceGroup}}
 
-ENDPOINT_FILE="endpoint-${{ lower(parameters.bu) }}.yml"
-ENDPOINT_NAME=$(yq '.name' "$ENDPOINT_FILE")
-KEY_VAULT_NAME="${{ parameters.keyVaultName }}"
+      ENDPOINT_FILE="endpoint-${{ lower(parameters.bu) }}.yml"
+      ENDPOINT_NAME="$(yq '.name' "$ENDPOINT_FILE")"
+      KEY_VAULT_NAME="${{ parameters.keyVaultName }}"
 
-echo "ENDPOINT_FILE=$ENDPOINT_FILE"
-echo "ENDPOINT_NAME=$ENDPOINT_NAME"
-echo "KEY_VAULT_NAME=$KEY_VAULT_NAME"
+      EXISTING_COUNT="$(az ml online-endpoint list --query "[?name=='$ENDPOINT_NAME'] | length(@)" -o tsv)"
+      if [ "$EXISTING_COUNT" = "0" ]; then
+        echo "Create endpoint..."
+        az ml online-endpoint create -f "$ENDPOINT_FILE"
+      fi
 
-EXISTING_COUNT=$(az ml online-endpoint list --query "[?name=='${ENDPOINT_NAME}'] | length(@)" -o tsv)
-echo "EXISTING_ENDPOINT_COUNT=$EXISTING_COUNT"
+      for i in {1..60}; do
+        STATE="$(az ml online-endpoint show -n "$ENDPOINT_NAME" --query provisioning_state -o tsv)"
+        echo "Endpoint provisioning_state: $STATE"
+        if [ "$STATE" = "Succeeded" ]; then
+          break
+        fi
+        if [ "$STATE" = "Failed" ]; then
+          az ml online-endpoint show -n "$ENDPOINT_NAME" -o jsonc || true
+          exit 1
+        fi
+        sleep 10
+      done
 
-if [ "$EXISTING_COUNT" = "0" ]; then
-  echo "Create endpoint..."
-  az ml online-endpoint create -f "$ENDPOINT_FILE"
-else
-  echo "Endpoint already exists; skipping create."
-fi
-
-echo "=============================="
-echo "STAGE: wait endpoint provisioning"
-echo "=============================="
-
-# WAIT aż endpoint nie będzie w Updating / Creating
-for i in {1..60}; do
-  STATE=$(az ml online-endpoint show -n "$ENDPOINT_NAME" --query provisioning_state -o tsv)
-  echo "Endpoint provisioning_state: $STATE"
-
-  if [ "$STATE" = "Succeeded" ]; then
-    echo "Endpoint is ready."
-    break
-  fi
-  if [ "$STATE" = "Failed" ]; then
-    echo "Endpoint FAILED. Showing endpoint details:"
-    az ml online-endpoint show -n "$ENDPOINT_NAME" -o jsonc || true
-    exit 1
-  fi
-  sleep 10
-done
-
-echo "=============================="
-echo "STAGE: store endpoint key in Key Vault (optional)"
-echo "=============================="
-
-# Ten fragment zostawiam — tylko go zabezpieczam:
-# - jeśli KVName pusty -> pomiń
-# - jeśli get-credentials się wywali -> pokaz błąd
-if [ -n "$KEY_VAULT_NAME" ]; then
-  # NOTE: jeżeli używasz --query primaryKey, to dopasuj do tego co macie
-  ENDPOINT_KEY=$(az ml online-endpoint get-credentials -n "$ENDPOINT_NAME" --query primaryKey -o tsv)
-  echo "Got endpoint key (length masked): ${#ENDPOINT_KEY}"
-
-  # Tu wstaw swoją nazwę secreta jak w oryginale
-  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "UnifiedModelEndpointKey" --value "$ENDPOINT_KEY"
-else
-  echo "No Key Vault name provided, skipping secret set."
-fi
+      if [ -n "$KEY_VAULT_NAME" ]; then
+        ENDPOINT_KEY="$(az ml online-endpoint get-credentials -n "$ENDPOINT_NAME" -o tsv --query primaryKey)"
+        az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "UnifiedModelApiKey" --value "$ENDPOINT_KEY"
+      fi
+  workingDirectory: src/deployment/managed_endpoint/${{parameters.environment}}/
 
 
 
@@ -65,69 +46,45 @@ fi
     #################################################
     #################################################
     #################################################
+- task: AzureCLI@2
+  name: deploy_model_managed_endpoint
+  displayName: Deploy Model To Managed Endpoint
+  inputs:
+    azureSubscription: ${{parameters.serviceConnection}}
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
 
-set -euxo pipefail
+      az configure --defaults workspace=${{parameters.amlWorkspace}} group=${{parameters.resourceGroup}}
 
-az configure --defaults workspace=${{parameters.amlWorkspace}} group=${{parameters.resourceGroup}}
+      MODEL_FILE="model-${{ lower(parameters.bu) }}.yml"
+      ENDPOINT_NAME="$(yq '.endpoint_name' "$MODEL_FILE")"
+      DEPLOYMENT_NAME="$(yq '.name' "$MODEL_FILE")"
 
-MODEL_FILE="model-${{ lower(parameters.bu) }}.yml"
-ENDPOINT_NAME=$(yq '.endpoint_name' "$MODEL_FILE")
-DEPLOYMENT_NAME=$(yq '.name' "$MODEL_FILE")
+      EXISTING_COUNT="$(az ml online-deployment list -e "$ENDPOINT_NAME" --query "[?name=='$DEPLOYMENT_NAME'] | length(@)" -o tsv)"
 
-echo "MODEL_FILE=$MODEL_FILE"
-echo "ENDPOINT_NAME=$ENDPOINT_NAME"
-echo "DEPLOYMENT_NAME=$DEPLOYMENT_NAME"
+      if [ "$EXISTING_COUNT" = "0" ]; then
+        echo "Create deployment for $DEPLOYMENT_NAME..."
+        az ml online-deployment create -f "$MODEL_FILE"
+      else
+        echo "Update deployment for $DEPLOYMENT_NAME..."
+        az ml online-deployment update -f "$MODEL_FILE"
+      fi
 
-echo "=============================="
-echo "STAGE: create/update deployment (NO TRAFFIC YET)"
-echo "=============================="
+      for i in {1..90}; do
+        STATE="$(az ml online-deployment show -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" --query provisioning_state -o tsv)"
+        echo "Deployment provisioning_state: $STATE"
+        if [ "$STATE" = "Succeeded" ]; then
+          break
+        fi
+        if [ "$STATE" = "Failed" ]; then
+          az ml online-deployment show -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" -o jsonc || true
+          az ml online-deployment get-logs -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" --lines 500 || true
+          exit 1
+        fi
+        sleep 10
+      done
 
-EXISTING_COUNT=$(az ml online-deployment list -e "$ENDPOINT_NAME" --query "[?name=='${DEPLOYMENT_NAME}'] | length(@)" -o tsv)
-echo "EXISTING_DEPLOYMENT_COUNT=$EXISTING_COUNT"
-
-if [ "$EXISTING_COUNT" = "0" ]; then
-  echo "Create deployment for $DEPLOYMENT_NAME..."
-  # !!! USUNIĘTE: --all-traffic
-  az ml online-deployment create -f "$MODEL_FILE"
-else
-  echo "Update deployment for $DEPLOYMENT_NAME..."
-  az ml online-deployment update -f "$MODEL_FILE"
-fi
-
-echo "=============================="
-echo "STAGE: wait deployment provisioning"
-echo "=============================="
-
-# WAIT na provisioning_state. Jeśli FAILED → get-logs i exit.
-for i in {1..90}; do
-  STATE=$(az ml online-deployment show -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" --query provisioning_state -o tsv)
-  echo "Deployment provisioning_state: $STATE"
-
-  if [ "$STATE" = "Succeeded" ]; then
-    echo "Deployment is healthy."
-    break
-  fi
-
-  if [ "$STATE" = "Failed" ]; then
-    echo "Deployment FAILED. Fetching logs..."
-    az ml online-deployment show -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" -o jsonc || true
-    az ml online-deployment get-logs -n "$DEPLOYMENT_NAME" -e "$ENDPOINT_NAME" --lines 500 || true
-    exit 1
-  fi
-
-  sleep 10
-done
-
-echo "=============================="
-echo "STAGE: set traffic AFTER deployment is healthy"
-echo "=============================="
-
-# Dopiero teraz traffic
-az ml online-endpoint update --name "$ENDPOINT_NAME" --traffic "${DEPLOYMENT_NAME}=100"
-echo "Traffic set to 100% for deployment: $DEPLOYMENT_NAME"
-
-echo "=============================="
-echo "STAGE: smoke check (optional)"
-echo "=============================="
-# Tu możesz ewentualnie dodać invoke jeśli masz sample.json:
-# az ml online-endpoint invoke -n "$ENDPOINT_NAME" --request-file sample.json
+      az ml online-endpoint update --name "$ENDPOINT_NAME" --traffic "$DEPLOYMENT_NAME=100"
+  workingDirectory: src/deployment/managed_endpoint/${{parameters.environment}}/
